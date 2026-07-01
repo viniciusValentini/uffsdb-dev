@@ -1,4 +1,14 @@
+#ifndef FBUFFER
 #define FBUFFER 1 // flag controlar os includes
+
+#include <stdint.h> // TRECHO ADICIONADO
+
+// CORREÇÃO: Evita redefinir SIZE se macros.h já o definiu
+#ifndef SIZE
+   #define SIZE 4096 // TRECHO ADICIONADO --> Tamanho do bloco;
+#endif
+
+#define MAX_BUFFERS 128 // TRECHO ADICIONADO --> Quantidade de páginas no pool;
 
 #ifndef FMACROS // garante que macros.h não seja reincluída
    #include "macros.h"
@@ -7,6 +17,30 @@
 #ifndef FTYPES // garante que types.h não seja reincluída
   #include "types.h"
 #endif
+
+typedef struct tp_block { // TRECHO ADICIONADO --> Estrutura para armazenar um bloco do buffer;
+    unsigned int nrec; // TRECHO ADICIONADO --> Número de registros armazenados na página;
+    uint32_t position; // TRECHO ADICIONADO --> Número de registro que a página ainda pode receber;
+    char data[4096]; // TRECHO ADICIONADO --> Dados (tuplas);
+} tp_block; // TRECHO ADICIONADO --> Estrutura para armazenar um bloco do buffer;
+
+// CORREÇÃO: Mudado para tp_frame para não colidir com o types.h
+typedef struct tp_frame { 
+    unsigned int id; // TRECHO ADICIONADO --> Identificador do buffer;
+    int tabela_id; // TRECHO ADICIONADO --> Identificador da tabela que está armazenada no buffer;
+    unsigned char db; // TRECHO ADICIONADO --> Dirty bit;
+    unsigned char pc; // TRECHO ADICIONADO --> Pin count;
+    tp_block block; // TRECHO ADICIONADO --> Bloco do buffer;
+} tp_frame; 
+
+typedef struct { // TRECHO ADICIONADO --> Estrutura para armazenar o pool de buffers;
+    tp_frame frames[MAX_BUFFERS]; // TRECHO ADICIONADO --> Array de blocos do buffer;
+} BufferPool; // TRECHO ADICIONADO --> Estrutura para armazenar o pool de buffers;
+
+// PROTOTIPAÇÃO DAS NOVAS FUNÇÕES:
+void initBufferPool(); // TRECHO ADICIONADO --> Função para inicializar o pool de buffers;
+tp_frame* get_buffer_page(unsigned int block_id, int tabela_id); // TRECHO ADICIONADO --> Função para recuperar uma página do buffer;
+void flushFrame(int frame_id); // TRECHO ADICIONADO --> Função para descarregar o frame especificado no disco;
 
 /*
     Esta função imprime todos os dados carregados numa determinada página do buffer
@@ -37,7 +71,7 @@ tp_buffer *getBlock(unsigned int id, char* filename);
 /*
     Retorna um buffer iniciado top top. 
 */
-tp_buffer * initBuffer(unsigned int id);
+tp_buffer* initBuffer(unsigned int id); 
 
 /*
     Esta função recupera uma página do buffer e retorna a mesma em uma estrutura do tipo tupla
@@ -46,7 +80,8 @@ tp_buffer * initBuffer(unsigned int id);
     *objeto - Estrutura que armazena dados sobre a tabela que está no buffer
     *page - Número da página a ser recuperada (0 a PAGES)
 */
-PageResult * getPage(tp_table *campos, struct fs_objects objeto, int page);
+PageResult *getPage(tp_table *campos, struct fs_objects objeto, int page); 
+
 /*
     Esta função uma determinada tupla do buffer e retorna a mesma em uma estrutura do tipo column;
     A estrutura column possui informações de como manipular os dados
@@ -73,3 +108,5 @@ void cria_campo(int , int , char *, int );
 int writeBufferToDisk(tp_buffer *bufferpool, struct fs_objects *objeto);
 
 void addColumn(column **colList, column *c);
+
+#endif
