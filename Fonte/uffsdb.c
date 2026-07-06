@@ -19,6 +19,9 @@
 #ifndef FDATABASE
    #include "database.h"
 #endif
+#ifndef FBUFFER
+   #include "buffer.h"
+#endif
 
 #include "interface/y.tab.h"
 
@@ -27,7 +30,10 @@ db_connected connected;
 
 int main(){
     dbInit(NULL);
-    
+
+    // inicializa o buffer manager com a qtd padrao de quadros pra mudar a quantidade de paginas na carga e so trocar esse numero aqui
+    initBufferManager(DEFAULT_FRAME_COUNT);
+
     printf("uffsdb (16.2).\nType \"help\" for help or \"implement\" for seeing what is or not is implemented in this project.\n\n");
     
     DEBUG_PRINT("UFFS DB Debugging mode.");
