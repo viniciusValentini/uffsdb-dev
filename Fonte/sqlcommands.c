@@ -321,7 +321,6 @@ int verificaChavePK(char *nomeTabela, column *c, char *nomeCampo, char *valorCam
 int finalizaInsert(char *nome, column *c, int tamTupla){
     column *auxC, *temp;
     int i = 0, x = 0, t, erro, encontrou, j = 0, flag=0;
-    FILE *dados;
     nodo *raiz = NULL;
     nodo *raizfk = NULL;
 
@@ -413,32 +412,28 @@ int finalizaInsert(char *nome, column *c, int tamTupla){
         }
     }
     flag = 0;
-    char directory[LEN_DB_NAME_IO];
-    strcpy(directory, connected.db_directory);
-    strcat(directory, dicio.nArquivo);
 
-    if((dados = fopen(directory,"r+b")) == NULL){
-        printf("ERROR: cannot open file.\n");
-        return ERRO_ABRIR_ARQUIVO;
-	}
-    long int offset = ftell(dados);
+    // offset so serve pro indice b mais da pk ou fk esse valor nunca eh lido de volta em nenhum lugar do sistema conferido no btree.c entao mantem 0 igual antes
+    long int offset = 0;
 
-    tp_buffer *buffer;
+    Frame *frame;
     if (objeto.lastBuffer == -1){
-        buffer = initBuffer(0);
         objeto.lastBuffer = 0;
         // se o insert falhar ele atualiza aqui e é problema para os futuros inserts.
-        updateSchema(&objeto); 
+        updateSchema(&objeto);
+        frame = pinPage(0, objeto.cod);
     } else {
-        buffer = getBlock(objeto.lastBuffer, directory);
-        if(buffer == NULL) return ERRO_ABRIR_ARQUIVO;
+        frame = pinPage(objeto.lastBuffer, objeto.cod);
+        if (frame == NULL) return ERRO_ABRIR_ARQUIVO;
 
-        if (buffer->position + tamTupla >= SIZE) {
-            buffer = initBuffer(objeto.lastBuffer + 1);
+        if (frame->page.usedBytes + tamTupla >= SIZE) {
+            unpinPage(frame);
             objeto.lastBuffer++;
-            updateSchema(&objeto); 
+            updateSchema(&objeto);
+            frame = pinPage(objeto.lastBuffer, objeto.cod);
         }
     }
+    if (frame == NULL) return ERRO_ABRIR_ARQUIVO;
 
     // fputc(0, dados); // flag para tupla não deletada
 
@@ -513,7 +508,7 @@ int finalizaInsert(char *nome, column *c, int tamTupla){
             while (i < strlen(auxC->valorCampo)){
                 if((auxC->valorCampo[i] < 48 || auxC->valorCampo[i] > 57) && auxC->valorCampo[i] != 45){
                     printf("ERROR: column \"%s\" expectet integer.\n", auxC->nomeCampo);
-                    fclose(dados);
+                    unpinPage(frame); // esse erro nao passa pelo fim entao solta o pino aqui direto
                     return ERRO_NO_TIPO_INTEIRO;
                 }
                 i++;
@@ -564,16 +559,14 @@ int finalizaInsert(char *nome, column *c, int tamTupla){
 
     }
     erro = SUCCESS;
-    buffer->nrec++;
-    memcpy(buffer->data + buffer->position, bufferTuple, tamTupla);
-    buffer->position += tamTupla;
-    DEBUG_PRINT("INSERT - Tuple size written in file: %d", tamTupla);
-    fseek(dados, buffer->id * sizeof(tp_buffer), SEEK_SET);
-    fwrite(buffer, sizeof(tp_buffer), 1, dados);
-    DEBUG_PRINT("INSERT - Block size written in file: %d",  sizeof(tp_buffer));
+    frame->page.recordCount++;
+    memcpy(frame->page.data + frame->page.usedBytes, bufferTuple, tamTupla);
+    frame->page.usedBytes += tamTupla;
+    frame->dirty = 1; // so marca a pagina como suja quem grava no disco eh o bm depois
+    DEBUG_PRINT("INSERT - Tuple size written in buffer: %d", tamTupla);
 
-    fim: //label para liberar a memória utilizada e fechar o arquivo de dados
-        fclose(dados);
+    fim: //label para liberar o pino da pagina usada
+        unpinPage(frame);
     return erro;
 }
 
@@ -840,33 +833,20 @@ void adcResultado(Lista *resultado, tupla *tuple, int *indiceProj, int qtdColuna
    ---------------------------------------------------------------------------------------------*/
 void op_delete(Lista *toDeleteTuples, char *tabelaName) {
     struct fs_objects objeto = leObjeto(tabelaName);
-    tp_buffer *buffer = NULL;
     int countDeletedTuples = 0;
 
-    char directory[LEN_DB_NAME_IO];
-    strcpy(directory, connected.db_directory);
-    strcat(directory, objeto.nArquivo);
-        
     for (Nodo *temp = toDeleteTuples->prim; temp; temp = temp->prox) {
         tupla *t = (tupla *)temp->inf;
-        if(!buffer ) buffer = getBlock(t->bufferPage, directory);
-        else if (buffer->id != t->bufferPage) {
-        // como as tuplas estão ordenadas fisicamente, isto reduz o IO. Quando o bufferpool tiver implementado, nem precisa
-            buffer->db = 0;
-            buffer->pc = 0;
-            writeBufferToDisk(buffer, &objeto);
-            buffer = getBlock(t->bufferPage, directory);
-        }
-        buffer->data[t->offset] = 1; //marca a tupla como deletada
-        buffer->db = 1; //marca a página como modificada
-        buffer->nrec--;
+        Frame *frame = pinPage(t->bufferPage, objeto.cod);
+        if (frame == NULL) continue;
+
+        frame->page.data[t->offset] = 1; //marca a tupla como deletada
+        frame->page.recordCount--;
+        frame->dirty = 1; //marca a pagina como modificada
+        unpinPage(frame);
         countDeletedTuples++;
     }
 
-    // write the last buffer 
-    if(buffer != NULL){
-        writeBufferToDisk(buffer, &objeto);
-    }
     printf("DELETED %d %s\n", countDeletedTuples, (countDeletedTuples != 1) ? "rows" : "row");
 }
 
@@ -1030,7 +1010,6 @@ void op_update(Lista *toUpdateTuples, inf_query *query)
     tp_table *esquema;
     struct fs_objects objeto = leObjeto(query->tabela);
     esquema = leSchema(objeto);
-    tp_buffer *buffer = NULL;
     int countUpdateTuples = 0;
 
     table *tabela = (table *)uffslloc(sizeof(table));
@@ -1042,17 +1021,10 @@ void op_update(Lista *toUpdateTuples, inf_query *query)
         return;
     }
 
-    char directory[LEN_DB_NAME_IO];
-    strcpy(directory, connected.db_directory);
-    strcat(directory, objeto.nArquivo);
-
     for (Nodo *temp = toUpdateTuples->prim; temp; temp = temp->prox){
         tupla *t = (tupla *)temp->inf;
-        if(!buffer) buffer = getBlock(t->bufferPage, directory);
-        else if (buffer->id != t->bufferPage) {
-            writeBufferToDisk(buffer, &objeto);
-            buffer = getBlock(t->bufferPage, directory);
-        }
+        Frame *frame = pinPage(t->bufferPage, objeto.cod);
+        if (frame == NULL) continue;
 
         int offsetVal = 0;
         for (size_t i = 0; i < t->ncols; i++){
@@ -1067,28 +1039,27 @@ void op_update(Lista *toUpdateTuples, inf_query *query)
                     // Atualiza o valor na tupla
                     if (col.tipoCampo == 'I')  {
                         int v = atoi(newValue);
-                        void *end_data = buffer->data + t->offset + 1 + offsetVal + t->ncols;
+                        void *end_data = frame->page.data + t->offset + 1 + offsetVal + t->ncols;
                         memcpy(end_data, &v, tamanho);
                     } else if (col.tipoCampo == 'D') {
                         double v = atof(newValue);
-                        void *end_data = buffer->data + t->offset + 1 + offsetVal + t->ncols;
+                        void *end_data = frame->page.data + t->offset + 1 + offsetVal + t->ncols;
                         memcpy(end_data, &v, tamanho);
                     } else {
 
-                        void *end_data = buffer->data + t->offset + 1 + offsetVal + t->ncols;
+                        void *end_data = frame->page.data + t->offset + 1 + offsetVal + t->ncols;
                         memcpy(end_data, newValue, tamanho);
                     }
                 }
                 valNode = valNode->prox;
             }
-            buffer[t->bufferPage].db = 1; // marca a página como modificada
+            frame->dirty = 1; // marca a pagina como modificada
             offsetVal += tamanho;
         }
 
+        unpinPage(frame);
         countUpdateTuples++;
     }
-
-    writeBufferToDisk(buffer, &objeto);
 
     printf("UPDATED %d %s\n", countUpdateTuples, (countUpdateTuples != 1) ? "rows" : "row");
 }
