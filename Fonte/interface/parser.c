@@ -24,6 +24,9 @@
 #ifndef FSQLCOMMANDS
    #include "../sqlcommands.h"
 #endif
+#ifndef FBUFFER
+   #include "../buffer.h"
+#endif
 #ifndef FPARSER
    #include "parser.h"
 #endif
@@ -406,6 +409,7 @@ int interface() {
         }
 
         clearGlobalStructs();
+        flushBufferPool(); // garante que os dados fiquem gravados apos cada comando
         uffsFree(TEMPORARY);
     }
     return 0;
