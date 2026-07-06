@@ -1,116 +1,269 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h> // TRECHO ADICIONADO --> Biblioteca para medir o tempo gasto em operações de buffer;
 #include "memoryContext.h"
 
-#ifndef FMACROS // garante que macros.h não seja reincluída
+#ifndef FMACROS
    #include "macros.h"
 #endif
-///
-#ifndef FTYPES // garante que types.h não seja reincluída
+
+#ifndef FTYPES
   #include "types.h"
 #endif
 
 #include "misc.h"
 #include "dictionary.h"
-#include "buffer.h" // TRECHO ADICIONADO --> Inclusão do header do buffer para acessar suas funções;
+#include "buffer.h"
 
 static int isDeleted(char *linha);
+static void writeFrameToDisk(Frame *frame);
+static void readFrameFromDisk(Frame *frame);
+static void buildFilePath(int tableId, char *path);
 
-BufferPool *pool = NULL; // TRECHO ADICIONADO --> Declaração do pool de buffers como variável global;
+// unico gerenciador do sistema inteiro
+static BufferManager manager;
 
-// NOVA INICIALIZAÇÃO DO BUFFER POOL:
-void initBufferPool() {
-    pool = (BufferPool*) uffslloc(sizeof(BufferPool)); // TRECHO ADICIONADO --> Alocação do pool de buffers;
-    if (pool == NULL) {
-        printf("ERROR: Buffer Pool allocation failed.\n\n"); // TRECHO ADICIONADO --> Verificação de alocação do pool de buffers;
-        exit(1); // TRECHO ADICIONADO --> Encerramento do programa em caso de falha na alocação do pool de buffers;
+void initBufferManager(int frameCount) {
+    if (frameCount <= 0 || frameCount > MAX_FRAMES) {
+        frameCount = DEFAULT_FRAME_COUNT;
     }
 
-    for (int i = 0; i < MAX_BUFFERS; i++) {
-        pool->frames[i].id = -1; // TRECHO ADICIONADO --> Inicialização do identificador do buffer como -1 para indicar que está vazio;
-        pool->frames[i].tabela_id = -1; // TRECHO ADICIONADO --> Inicialização do identificador da tabela como -1 para indicar que está vazio;
-        pool->frames[i].db = 0; // TRECHO ADICIONADO --> Inicialização do identificador da base de dados como 0 para indicar que está vazio;
-        pool->frames[i].pc = 0; // TRECHO ADICIONADO --> Inicialização do identificador do programa como 0 para indicar que está vazio;
-        pool->frames[i].block.nrec = 0; // TRECHO ADICIONADO --> Inicialização do número de registros como 0 para indicar que está vazio;
-        pool->frames[i].block.position = 0; // TRECHO ADICIONADO --> Inicialização da posição como 0 para indicar que está vazio;
+    // tem que alocar em PERMANENT e nao com uffslloc pq o contexto TEMPORARY eh liberado inteiro depois de cada comando sql ver parser.c se alocasse com uffslloc o pool virava lixo de memoria assim que o primeiro comando terminasse
+    manager.pool = (BufferPool *) uffsllocType(sizeof(BufferPool), PERMANENT);
+
+    if (manager.pool == NULL) {
+        printf("ERROR: falha ao alocar o buffer pool.\n\n");
+        exit(1);
     }
-    srand(time(NULL)); // TRECHO ADICIONADO --> Inicialização da semente para geração de números aleatórios;
+
+    manager.pool->activeFrameCount = frameCount;
+    manager.pool->clockHand = 0;
+    manager.pageSize = SIZE;
+    manager.diskReads = 0;
+    manager.diskWrites = 0;
+
+    for (int i = 0; i < MAX_FRAMES; i++) {
+        manager.pool->frames[i].blockId = -1;
+        manager.pool->frames[i].tableId = -1;
+        manager.pool->frames[i].dirty = 0;
+        manager.pool->frames[i].pinCount = 0;
+        manager.pool->frames[i].referenced = 0;
+        manager.pool->frames[i].page.recordCount = 0;
+        manager.pool->frames[i].page.usedBytes = 0;
+    }
+
+    printf("Buffer Manager iniciado com %d quadros de %d bytes.\n", frameCount, SIZE);
 }
 
-void flushFrame(int frame_id) { // TRECHO ADICIONADO --> Função para descarregar o frame especificado no disco;
-    // Lógica para obter o nome da tabela pelo tabela_id e dar fwrite
-    // no deslocamento (id * sizeof(tp_block))
-    printf("Gravando bloco %u da tabela %d no disco...\n", 
-            pool->frames[frame_id].id, pool->frames[frame_id].tabela_id); // TRECHO ADICIONADO --> Exibe mensagem de gravação do frame;
-    pool->frames[frame_id].db = 0; // TRECHO ADICIONADO --> Reseta o bit de sujeira (dirty bit) após salvar;
+static void buildFilePath(int tableId, char *path) {
+    struct fs_objects objeto = leObjetoById(tableId);
+    strcpy(path, connected.db_directory);
+    strcat(path, objeto.nArquivo);
 }
 
-// NOVO GERENCIADOR DE PÁGINAS:
-tp_frame* get_buffer_page(unsigned int block_id, int tabela_id) { // TRECHO ADICIONADO --> Função para recuperar uma página do buffer;
-    if (pool == NULL) { // TRECHO ADICIONADO --> Verificação se o pool de buffers foi inicializado;
-        initBufferPool(); // TRECHO ADICIONADO --> Inicialização do pool de buffers caso ainda não tenha sido feita;
+static void readFrameFromDisk(Frame *frame) {
+    char path[LEN_DB_NAME_IO];
+    buildFilePath(frame->tableId, path);
+
+    FILE *file = fopen(path, "r+b");
+    if (file == NULL) {
+        // arquivo novo sem nada gravado ainda acontece no primeiro insert de uma tabela deixa a pagina zerado
+        frame->page.recordCount = 0;
+        frame->page.usedBytes = 0;
+        return;
     }
 
-    // 1. BUFFER HIT:
-    for (int i = 0; i < MAX_BUFFERS; i++) {
-        if (pool->frames[i].id == block_id && pool->frames[i].tabela_id == tabela_id) {
-            pool->frames[i].pc++;
+    long int pos = (long int) frame->blockId * sizeof(DiskPage);
+    fseek(file, pos, SEEK_SET);
+    fread(&(frame->page), sizeof(DiskPage), 1, file);
+    fclose(file);
+
+    manager.diskReads++;
+}
+
+// unica funcao do sistema inteiro que grava pagina de tabela no disco
+static void writeFrameToDisk(Frame *frame) {
+    char path[LEN_DB_NAME_IO];
+    buildFilePath(frame->tableId, path);
+
+    FILE *file = fopen(path, "r+b");
+    if (file == NULL) {
+        printf("ERROR: nao foi possivel abrir o arquivo pra gravar a pagina.\n");
+        return;
+    }
+
+    long int pos = (long int) frame->blockId * sizeof(DiskPage);
+    fseek(file, pos, SEEK_SET);
+    fwrite(&(frame->page), sizeof(DiskPage), 1, file);
+    fclose(file);
+
+    frame->dirty = 0;
+    manager.diskWrites++;
+}
+
+Frame *pinPage(unsigned int blockId, int tableId) {
+    BufferPool *pool = manager.pool;
+
+    for (int i = 0; i < pool->activeFrameCount; i++) {
+        if (pool->frames[i].blockId == (int) blockId && pool->frames[i].tableId == tableId) {
+            pool->frames[i].pinCount++;
+            pool->frames[i].referenced = 1;
             return &(pool->frames[i]);
         }
     }
 
-    char directory[LEN_DB_NAME_IO];
-    strcpy(directory, connected.db_directory);
+    for (int i = 0; i < pool->activeFrameCount; i++) {
+        if (pool->frames[i].blockId == -1) {
+            pool->frames[i].blockId = blockId;
+            pool->frames[i].tableId = tableId;
+            pool->frames[i].dirty = 0;
+            pool->frames[i].pinCount = 1;
+            pool->frames[i].referenced = 1;
+            readFrameFromDisk(&(pool->frames[i]));
+            return &(pool->frames[i]);
+        }
+    }
 
-    // 2. BUFFER MISS:
-    for (int i = 0; i < MAX_BUFFERS; i++) {
-        if (pool->frames[i].id == -1) {
-            FILE *fd = fopen(directory, "r+b");
-            if (fd) {
-                long int pos = (long int)block_id * sizeof(tp_block);
-                fseek(fd, pos, SEEK_SET);
-                fread(&(pool->frames[i].block), sizeof(tp_block), 1, fd); 
-                fclose(fd);
+    // pool cheio usa segunda chance o clockHand roda em circulo pelos quadro se o quadro ta pinado so pula se o bit de referencia ta ligado desliga o bit e da mais uma chance sem virar vitima ainda se o bit ja ta desligado e sem pino essa vira a vitima maxVoltas eh so pra nao ficar girando pra sempre no caso raro de tudo estar pinado
+    int voltas = 0;
+    int maxVoltas = 2 * pool->activeFrameCount;
+
+    while (voltas < maxVoltas) {
+        Frame *atual = &(pool->frames[pool->clockHand]);
+
+        if (atual->pinCount == 0) {
+            if (atual->referenced) {
+                atual->referenced = 0;
+            } else {
+                int victim = pool->clockHand;
+                pool->clockHand = (pool->clockHand + 1) % pool->activeFrameCount;
+
+                if (pool->frames[victim].dirty) {
+                    writeFrameToDisk(&(pool->frames[victim]));
+                }
+
+                pool->frames[victim].blockId = blockId;
+                pool->frames[victim].tableId = tableId;
+                pool->frames[victim].dirty = 0;
+                pool->frames[victim].pinCount = 1;
+                pool->frames[victim].referenced = 1;
+                readFrameFromDisk(&(pool->frames[victim]));
+
+                return &(pool->frames[victim]);
             }
-
-            pool->frames[i].id = block_id;
-            pool->frames[i].tabela_id = tabela_id;
-            pool->frames[i].pc = 1;
-            pool->frames[i].db = 0;
-            return &(pool->frames[i]);
         }
+
+        pool->clockHand = (pool->clockHand + 1) % pool->activeFrameCount;
+        voltas++;
     }
 
-    // 3. Buffer lotado: Substituição Aleatória (conforme solicitado)
-    int vitima; // TRECHO ADICIONADO --> Declaração da variável para armazenar o índice do frame vítima escolhido;
-    int tentativas = 0; // TRECHO ADICIONADO --> Contador de tentativas de busca por uma vítima elegível;
-    do {
-        vitima = rand() % MAX_BUFFERS; // TRECHO ADICIONADO --> Sorteia aleatoriamente um frame candidato a vítima;
-        tentativas++; // TRECHO ADICIONADO --> Incrementa o número de tentativas realizadas;
-    } while(pool->frames[vitima].pc > 0 && tentativas < MAX_BUFFERS); // TRECHO ADICIONADO --> Continua sorteando se o frame estiver pinado e houver tentativas;
-
-    if(pool->frames[vitima].pc > 0) { // TRECHO ADICIONADO --> Verifica se todos os blocos disponíveis estão favoritados;
-        printf("Erro: Todos os blocos estao favoritados (pinned)!\n"); // TRECHO ADICIONADO --> Exibe erro caso nenhum bloco possa ser substituído;
-        return NULL; // TRECHO ADICIONADO --> Retorna NULL em caso de falha por buffer totalmente pinado;
-    }
-
-    // Se a vítima estiver "suja", salva no disco antes de sobrescrever
-    if(pool->frames[vitima].db == 1) { // TRECHO ADICIONADO --> Verifica se o bloco foi modificado (dirty bit ativo);
-        flushFrame(vitima); // TRECHO ADICIONADO --> Chama a função flushFrame para salvar as alterações em disco;
-    }
-
-    // Atualiza o frame com os novos dados
-    pool->frames[vitima].id = block_id; // TRECHO ADICIONADO --> Atualiza o identificador do bloco no frame escolhido;
-    pool->frames[vitima].tabela_id = tabela_id; // TRECHO ADICIONADO --> Atualiza o identificador da tabela no frame escolhido;
-    pool->frames[vitima].db = 0; // TRECHO ADICIONADO --> Reseta o dirty bit do novo bloco carregado;
-    pool->frames[vitima].pc = 1; // TRECHO ADICIONADO --> Define o pin count inicial do novo bloco como 1;
-    
-    return &(pool->frames[vitima]); // TRECHO ADICIONADO --> Retorna o ponteiro para o frame da vítima atualizado;
+    printf("ERROR: buffer pool cheio, todas as paginas estao em uso.\n");
+    return NULL;
 }
 
-//// imprime os dados no buffer (deprecated?)
+void unpinPage(Frame *frame) {
+    if (frame == NULL) return;
+    if (frame->pinCount > 0) frame->pinCount--;
+}
+
+void flushBufferPool() {
+    BufferPool *pool = manager.pool;
+    for (int i = 0; i < pool->activeFrameCount; i++) {
+        if (pool->frames[i].dirty) {
+            writeFrameToDisk(&(pool->frames[i]));
+        }
+    }
+}
+
+PageResult *getPage(tp_table *campos, struct fs_objects objeto, int page) {
+    if (page >= PAGES || page < 0) return ERRO_PAGINA_INVALIDA;
+
+    Frame *frame = pinPage((unsigned int) page, objeto.cod);
+    if (frame == NULL) return ERRO_PAGINA_INVALIDA;
+
+    DiskPage *pagina = &(frame->page);
+
+    tupla *tuplas = (tupla *) uffslloc(sizeof(tupla) * (pagina->recordCount));
+    if (!tuplas) {
+        unpinPage(frame);
+        return ERRO_DE_ALOCACAO;
+    }
+
+    int indiceTupla = 0, i = 0;
+    if (!pagina->usedBytes) {
+        unpinPage(frame);
+        return NULL;
+    }
+
+    char *nullos = (char *) uffslloc(objeto.qtdCampos * sizeof(char));
+
+    while (i < pagina->usedBytes) {
+        if (isDeleted(pagina->data + i)) {
+            i += tamTupla(campos, objeto);
+            continue;
+        }
+        tuplas[indiceTupla].offset = i;
+        tuplas[indiceTupla].ncols = objeto.qtdCampos;
+        i++;
+        memcpy(nullos, pagina->data + i, objeto.qtdCampos);
+        i += objeto.qtdCampos;
+
+        tuplas[indiceTupla].column = (column *) uffslloc(sizeof(column) * objeto.qtdCampos);
+        tuplas[indiceTupla].bufferPage = page;
+        for (int ic = 0; ic < objeto.qtdCampos; ic++) {
+            column *c = &tuplas[indiceTupla].column[ic];
+            c->tipoCampo = campos[ic].tipo;
+            strcpy(c->nomeCampo, campos[ic].nome);
+            if (nullos[ic]) c->valorCampo = COLUNA_NULL;
+            else {
+                c->valorCampo = (char *) uffslloc(sizeof(char) * campos[ic].tam + 1);
+                memcpy(c->valorCampo, pagina->data + i, campos[ic].tam);
+                c->valorCampo[campos[ic].tam] = '\0';
+            }
+            i += campos[ic].tam;
+        }
+        indiceTupla++;
+    }
+
+    PageResult *pg = (PageResult *) uffslloc(sizeof(PageResult));
+    pg->tuplas = tuplas;
+    pg->nrec = indiceTupla;
+
+    unpinPage(frame);
+    return pg;
+}
+
+void cria_campo(int tam, int header, char *val, int x) {
+    int i;
+    char aux[30];
+    if (header) {
+        for (i = 0; i <= 30 && val[i] != '\0'; i++) aux[i] = val[i];
+        for (; i < 30; i++) aux[i] = ' ';
+        aux[i] = '\0';
+        printf("%s", aux);
+        return;
+    }
+    for (i = 0; i < x; i++) printf(" ");
+}
+
+static int isDeleted(char *linha) {
+    return linha[0];
+}
+
+void addColumn(column **colList, column *c) {
+    c->next = NULL;
+    if (*colList == NULL) {
+        *colList = c;
+        return;
+    }
+    column *t = *colList;
+    while (t->next != NULL) t = t->next;
+    t->next = c;
+}
+
+/*
+codigo antigo de antes do buffer manager novo mantido so comentado pra referencia historica usava a struct tp_buffer de types.h e abria fechava o arquivo a cada chamada sem cache nenhum ninguem mais chama essas funcao depois da migracao pro buffer manager novo pinPage unpinPage flushBufferPool
+
 int printbufferpoll(tp_buffer *buffpoll, tp_table *s, struct fs_objects objeto, int num_page){
     int aux, i, num_reg = objeto.qtdCampos;
 
@@ -120,7 +273,7 @@ int printbufferpoll(tp_buffer *buffpoll, tp_table *s, struct fs_objects objeto, 
 
     i = aux = 0;
     aux = cabecalho(s, num_reg);
-    while(i < buffpoll[num_page].nrec){ 
+    while(i < buffpoll[num_page].nrec){
         drawline(buffpoll, s, objeto, i, num_page);
         i++;
     }
@@ -154,81 +307,26 @@ tp_buffer *getBlock(unsigned int id, char* filename){
     return buffer;
 }
 
-// RETORNA PAGINA DO BUFFER
-PageResult *getPage(tp_table *campos, struct fs_objects objeto, int page){
-    if(page >= PAGES || page < 0) return ERRO_PAGINA_INVALIDA;
-
-    char directory[LEN_DB_NAME_IO];
-    strcpy(directory, connected.db_directory);
-    strcat(directory, objeto.nArquivo);
-
-    tp_buffer *buffer = getBlock((unsigned int) page, directory);
-    tupla *tuplas = (tupla *)uffslloc(sizeof(tupla) * (buffer->nrec)); 
-
-    if(!tuplas)
-        return ERRO_DE_ALOCACAO;
-
-    int indiceTupla = 0, i = 0;
-    if (!buffer->position)
-        return NULL;
-
-    char* nullos = (char *)uffslloc(objeto.qtdCampos * sizeof(char));
-
-    while(i < buffer->position){
-        if(isDeleted(buffer->data + i)) {
-            i += tamTupla(campos, objeto);
-            continue;
-        }
-        tuplas[indiceTupla].offset = i; 
-        tuplas[indiceTupla].ncols = objeto.qtdCampos;
-        i++; 
-        memcpy(nullos, buffer->data + i, objeto.qtdCampos);
-        i += objeto.qtdCampos;
-
-        tuplas[indiceTupla].column = (column *)uffslloc(sizeof(column) * objeto.qtdCampos);
-        tuplas[indiceTupla].bufferPage = page;
-        for (int ic = 0; ic < objeto.qtdCampos; ic++){
-            column *c = &tuplas[indiceTupla].column[ic];
-            c->tipoCampo = campos[ic].tipo;
-            strcpy(c->nomeCampo, campos[ic].nome); 
-            if(nullos[ic]) c->valorCampo = COLUNA_NULL;
-            else {
-                c->valorCampo = (char *)uffslloc(sizeof(char) * campos[ic].tam + 1);
-                memcpy(c->valorCampo, buffer->data + i, campos[ic].tam);
-                c->valorCampo[campos[ic].tam] = '\0';
-            }
-            i += campos[ic].tam;
-        }
-        indiceTupla++;
-    }
-    PageResult *pg = (PageResult *)uffslloc(sizeof(PageResult));
-    pg->tuplas = tuplas;
-    pg->nrec = indiceTupla;
-
-    return pg; 
-}
-
-// EXCLUIR TUPLA BUFFER
 column * excluirTuplaBuffer(tp_buffer *buffer, tp_table *campos, struct fs_objects objeto, int page, int nTupla){
     column *tuplas = (column *)uffslloc(sizeof(column)*objeto.qtdCampos);
 
     if(tuplas == NULL)
         return ERRO_DE_ALOCACAO;
 
-    if(buffer[page].nrec == 0) 
+    if(buffer[page].nrec == 0)
         return ERRO_PARAMETRO;
 
     int i, tamTpl = tamTupla(campos, objeto), j = 0, t = 0;
-    i = tamTpl * nTupla; 
+    i = tamTpl * nTupla;
 
     while(i < tamTpl * nTupla + tamTpl){
         t = 0;
-        tuplas[j].valorCampo = (char *)uffslloc(sizeof(char)*campos[j].tam); 
-        tuplas[j].tipoCampo = campos[j].tipo;  
-        strcpylower(tuplas[j].nomeCampo, campos[j].nome);   
+        tuplas[j].valorCampo = (char *)uffslloc(sizeof(char)*campos[j].tam);
+        tuplas[j].tipoCampo = campos[j].tipo;
+        strcpylower(tuplas[j].nomeCampo, campos[j].nome);
 
         while(t < campos[j].tam){
-            tuplas[j].valorCampo[t] = buffer[page].data[i];    
+            tuplas[j].valorCampo[t] = buffer[page].data[i];
             t++;
             i++;
         }
@@ -236,18 +334,17 @@ column * excluirTuplaBuffer(tp_buffer *buffer, tp_table *campos, struct fs_objec
     }
     j = i;
     i = tamTpl * nTupla;
-    for(; i < buffer[page].position; i++, j++) 
+    for(; i < buffer[page].position; i++, j++)
         buffer[page].data[i] = buffer[page].data[j];
 
     buffer[page].position -= tamTpl;
     buffer[page].nrec--;
 
-    return tuplas; 
+    return tuplas;
 }
 
-// INSERE UMA TUPLA NO BUFFER!
-char *getTupla(tp_table *campos, struct fs_objects objeto, int from){ 
-    int tamTpl = tamTupla(campos, objeto); 
+char *getTupla(tp_table *campos, struct fs_objects objeto, int from){
+    int tamTpl = tamTupla(campos, objeto);
     char *linha = (char *)uffslloc(sizeof(char)*tamTpl);
 
     FILE *dados;
@@ -266,21 +363,20 @@ char *getTupla(tp_table *campos, struct fs_objects objeto, int from){
         fclose(dados);
         return ERRO_DE_LEITURA;
     }
-    
+
     fseek(dados, -1, SEEK_CUR);
-    fread(linha, sizeof(char), tamTpl, dados); 
+    fread(linha, sizeof(char), tamTpl, dados);
 
     fclose(dados);
     return linha;
 }
 
-void setTupla(tp_buffer *buffer, char *tupla, int tam, int pos) { 
+void setTupla(tp_buffer *buffer, char *tupla, int tam, int pos) {
   int i = buffer[pos].position;
   for (; i < buffer[pos].position + tam; i++)
     buffer[pos].data[i] = *(tupla++);
 }
 
-//// insere uma tupla no buffer
 int colocaTuplaBuffer(tp_buffer *buffer, int from, tp_table *campos, struct fs_objects objeto){
     int i, found;
     char *tupla = getTupla(campos, objeto, from);
@@ -292,7 +388,7 @@ int colocaTuplaBuffer(tp_buffer *buffer, int from, tp_table *campos, struct fs_o
         if(SIZE - buffer[i].position > tam) {
             setTupla(buffer, tupla, tam, i);
             found = 1;
-            buffer[i].position += tam; 
+            buffer[i].position += tam;
             if(isDeleted(tupla)) {
                 return ERRO_LEITURA_DADOS_DELETADOS;
             }
@@ -302,21 +398,8 @@ int colocaTuplaBuffer(tp_buffer *buffer, int from, tp_table *campos, struct fs_o
     return found ? SUCCESS : ERRO_BUFFER_CHEIO;
 }
 
-void cria_campo(int tam, int header, char *val, int x) {
-  int i;
-  char aux[30];
-  if(header){
-    for(i = 0; i <= 30 && val[i] != '\0'; i++) aux[i] = val[i];
-    for(;i < 30;i++) aux[i] = ' ';
-    aux[i] ='\0';
-    printf("%s", aux);
-    return;
-  }
-  for(i = 0; i < x; i++) printf(" ");
-}
-
 int writeBufferToDisk(tp_buffer *buffer, struct fs_objects *objeto) {
-    int success = 1; 
+    int success = 1;
     char directory[LEN_DB_NAME_IO];
     strcpy(directory, connected.db_directory);
     strcat(directory, objeto->nArquivo);
@@ -326,7 +409,7 @@ int writeBufferToDisk(tp_buffer *buffer, struct fs_objects *objeto) {
         printf("ERROR: Unable to open file for writing.\n");
         return 0;
     }
-    
+
     fseek(dados, buffer->id * sizeof(tp_buffer), SEEK_SET);
     buffer->db = 0;
     buffer->pc = 0;
@@ -335,18 +418,4 @@ int writeBufferToDisk(tp_buffer *buffer, struct fs_objects *objeto) {
 
     return success;
 }
-
-static int isDeleted(char *linha){
-    return linha[0]; 
-}
-
-void addColumn(column **colList, column *c){
-    c->next = NULL;
-    if(*colList == NULL) {
-        *colList = c;
-        return;
-    }
-    column *t = *colList;
-    while(t->next != NULL) t = t->next;
-    t->next = c;
-}
+*/
