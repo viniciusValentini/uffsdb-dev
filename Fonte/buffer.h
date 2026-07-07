@@ -11,19 +11,21 @@
   #include "types.h"
 #endif
 
-// pool so aceita ate uns 10 quadro pq o alocador de memoria do projeto uffsllocType nao deixa alocar mais que 16kb de uma vez e o bufferpool inteiro tem que caber nesse limite
+// pool so aceita ate uns 10 quadro pq o alocador de
+// memoria do projeto uffsllocType nao deixa alocar
+// mais que 16kb de uma vez e o bufferpool inteiro tem que caber nesse limite
 #define MAX_FRAMES 10
 
-// qtd usada quando ninguem escolhe outra na carga do sgbd isso eh o configuravel na carga pedido no trabalho
+// qtd usada quando ninguem escolhe outra na carga do sgbd
 #define DEFAULT_FRAME_COUNT 8
 
-// separa o que vai pro disco do que fica so em memoria nada de dirty bit ou pin aqui
-typedef struct DiskPage {
+typedef struct DiskPage { // so o q eh gravado no disco
     unsigned int recordCount;
     uint32_t usedBytes;
-    char data[SIZE];
+    char data[SIZE]; // 1024 bytes
 } DiskPage;
 
+// metadado q so existem em memoria
 typedef struct Frame {
     int blockId;              // -1 quando o quadro ta vazio
     int tableId;                // -1 quando vazio, cada tabela tem seu proprio id objeto cod
@@ -34,27 +36,32 @@ typedef struct Frame {
 } Frame;
 
 typedef struct {
-    Frame frames[MAX_FRAMES];
+    Frame frames[MAX_FRAMES]; // max frames de 10
     int activeFrameCount;   // qtd de quadro realmente configurada pode ser menor que MAX_FRAMES
     int clockHand;            // posicao atual do ponteiro do relogio
 } BufferPool;
 
-typedef struct {
+typedef struct { // struct nova do bm, tem o ponteiro da pool e estatisticas de uso
     BufferPool *pool;
     int pageSize;
     int diskReads;
     int diskWrites;
 } BufferManager;
 
+// inicia o bm e aloca o pool de quadros em memoria permanete e zera ele
 void initBufferManager(int frameCount);
 
+// pede uma pag emprestada cache hit/ pina
 // depois de usar tem que chamar unpinPage se esquecer o pool enche de pino e trava
 Frame *pinPage(unsigned int blockId, int tableId);
 
+// devolve a pag emprestada/despina
 void unpinPage(Frame *frame);
 
+// percorre todos os quadros e graba no disco os modificados (dirty=1)
 void flushBufferPool();
 
+// decodificador uma pag em tuplas usaveis pelo sql
 PageResult *getPage(tp_table *campos, struct fs_objects objeto, int page);
 
 // funcao de exibicao usada em misc.c sem relacao com o buffer manager mantida sem mudar nome
