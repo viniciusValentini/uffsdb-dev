@@ -1,18 +1,18 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "memoryContext.h"
+#include "memoryContext.h" // uffsllocType, uffslloc, PERMANENT/TEMPORARY
 
 #ifndef FMACROS
-   #include "macros.h"
+   #include "macros.h" // size, pages, len_db_name_io
 #endif
 
 #ifndef FTYPES
-  #include "types.h"
+  #include "types.h" // tupla, collumm, pageResult, fs_objects, tp_table
 #endif
 
 #include "misc.h"
-#include "dictionary.h"
+#include "dictionary.h" // tamTupla, leObjetoById
 #include "buffer.h"
 
 static int isDeleted(char *linha);
@@ -20,15 +20,17 @@ static void writeFrameToDisk(Frame *frame);
 static void readFrameFromDisk(Frame *frame);
 static void buildFilePath(int tableId, char *path);
 
-// unico gerenciador do sistema inteiro
+// anteriormente BufferPool *pool = NULL;
 static BufferManager manager;
 
-void initBufferManager(int frameCount) {
-    if (frameCount <= 0 || frameCount > MAX_FRAMES) {
-        frameCount = DEFAULT_FRAME_COUNT;
+void initBufferManager(int frameCount) { // qts quadros vao ficar ativos nessa execuçao
+    if (frameCount <= 0 || frameCount > MAX_FRAMES) { // frame deve ser maior q zero e menor q max_frames = 10
+        frameCount = DEFAULT_FRAME_COUNT; // se nao, usa o valor padrao de 8 frames
     }
 
-    // tem que alocar em PERMANENT e nao com uffslloc pq o contexto TEMPORARY eh liberado inteiro depois de cada comando sql ver parser.c se alocasse com uffslloc o pool virava lixo de memoria assim que o primeiro comando terminasse
+    // tem que alocar em PERMANENT e nao com uffslloc
+    // pq o contexto TEMPORARY eh liberado inteiro depois de cada comando sql
+    // se alocasse com uffslloc o pool virava lixo de memoria assim que o primeiro comando terminasse
     manager.pool = (BufferPool *) uffsllocType(sizeof(BufferPool), PERMANENT);
 
     if (manager.pool == NULL) {
@@ -36,32 +38,32 @@ void initBufferManager(int frameCount) {
         exit(1);
     }
 
-    manager.pool->activeFrameCount = frameCount;
-    manager.pool->clockHand = 0;
+    manager.pool->activeFrameCount = frameCount; // qt dos 10 quadros sao usados
+    manager.pool->clockHand = 0; // posiciona o ponteiro do clock no primeiro quadro
     manager.pageSize = SIZE;
     manager.diskReads = 0;
     manager.diskWrites = 0;
 
-    for (int i = 0; i < MAX_FRAMES; i++) {
-        manager.pool->frames[i].blockId = -1;
-        manager.pool->frames[i].tableId = -1;
+    for (int i = 0; i < MAX_FRAMES; i++) { // zera todos os 10 quadros do array
+        manager.pool->frames[i].blockId = -1; // -1 quadro vazio/disponivel
+        manager.pool->frames[i].tableId = -1; // -1 quadro vazio/disponivel
         manager.pool->frames[i].dirty = 0;
         manager.pool->frames[i].pinCount = 0;
         manager.pool->frames[i].referenced = 0;
         manager.pool->frames[i].page.recordCount = 0;
         manager.pool->frames[i].page.usedBytes = 0;
     }
-
+    // mensagem padrao sempre que se conecta ao banco, quadro ativos e tam da pag
     printf("Buffer Manager iniciado com %d quadros de %d bytes.\n", frameCount, SIZE);
 }
-
+// para montar o caminho fisico da tabela
 static void buildFilePath(int tableId, char *path) {
     struct fs_objects objeto = leObjetoById(tableId);
-    strcpy(path, connected.db_directory);
-    strcat(path, objeto.nArquivo);
+    strcpy(path, connected.db_directory); // copy o diretorio do bd conectado
+    strcat(path, objeto.nArquivo); // concatena o nome do arq
 }
-
-static void readFrameFromDisk(Frame *frame) {
+// carrega a pag fisica para dentro do frame
+static void readFrameFromDisk(Frame *frame) { // recebe o pont do frame q deve ter o tableid
     char path[LEN_DB_NAME_IO];
     buildFilePath(frame->tableId, path);
 
@@ -72,8 +74,10 @@ static void readFrameFromDisk(Frame *frame) {
         frame->page.usedBytes = 0;
         return;
     }
-
-    long int pos = (long int) frame->blockId * sizeof(DiskPage);
+    // calcular deslocamento
+    // cada pag logica ocupa sizeof(DiskPage) bytes
+    // (1032 bytes: 4 de recordCount + 4 de usedBytes + 1024 de data)
+    long int pos = (long int) frame->blockId * sizeof(DiskPage); // começa no blockid x 1032 de data
     fseek(file, pos, SEEK_SET);
     fread(&(frame->page), sizeof(DiskPage), 1, file);
     fclose(file);
@@ -81,67 +85,72 @@ static void readFrameFromDisk(Frame *frame) {
     manager.diskReads++;
 }
 
-// unica funcao do sistema inteiro que grava pagina de tabela no disco
+// grava pag fisica a partir do frame no disco
 static void writeFrameToDisk(Frame *frame) {
-    char path[LEN_DB_NAME_IO];
+    char path[LEN_DB_NAME_IO]; // monta o caminho
     buildFilePath(frame->tableId, path);
 
     FILE *file = fopen(path, "r+b");
     if (file == NULL) {
-        printf("ERROR: nao foi possivel abrir o arquivo pra gravar a pagina.\n");
+        printf("ERROR: nao foi possivel abrir o arquivo pra gravar a pagina.\n"); // erro fatal, n grava nada
         return;
     }
-
+    // calculo do deslocamento, grava apenas o conteudo logico da pag e os metadados nunca tocam o disco
     long int pos = (long int) frame->blockId * sizeof(DiskPage);
     fseek(file, pos, SEEK_SET);
     fwrite(&(frame->page), sizeof(DiskPage), 1, file);
     fclose(file);
 
-    frame->dirty = 0;
-    manager.diskWrites++;
+    frame->dirty = 0; // versao gravad em disco esta igual a de memoria entao zera
+    manager.diskWrites++; // contador de escritas
 }
-
-Frame *pinPage(unsigned int blockId, int tableId) {
-    BufferPool *pool = manager.pool;
-
+// para pedir uma pag e pinar
+Frame *pinPage(unsigned int blockId, int tableId) { // qual pag de qual tabela
+    BufferPool *pool = manager.pool; // atalho local do pool evira os milhares de manager.pool->
+    // cache hit, percorre os quadros ativos comparando com a pag e tabela solicitado
     for (int i = 0; i < pool->activeFrameCount; i++) {
         if (pool->frames[i].blockId == (int) blockId && pool->frames[i].tableId == tableId) {
-            pool->frames[i].pinCount++;
-            pool->frames[i].referenced = 1;
-            return &(pool->frames[i]);
+            pool->frames[i].pinCount++; // mais um user ativo nesse quadro
+            pool->frames[i].referenced = 1; // proteçao de ser vitima do clock
+            return &(pool->frames[i]); // retorna sem precisar ir a disco, win win
         }
     }
-
+    // cache miss, busca quadro livre
     for (int i = 0; i < pool->activeFrameCount; i++) {
-        if (pool->frames[i].blockId == -1) {
-            pool->frames[i].blockId = blockId;
+        if (pool->frames[i].blockId == -1) { // procura o primeiro quadro vazio (-1)
+            pool->frames[i].blockId = blockId; // ocupa esse quadro
             pool->frames[i].tableId = tableId;
             pool->frames[i].dirty = 0;
-            pool->frames[i].pinCount = 1;
-            pool->frames[i].referenced = 1;
-            readFrameFromDisk(&(pool->frames[i]));
+            pool->frames[i].pinCount = 1; // primeiro user
+            pool->frames[i].referenced = 1; // protege de ser vitima do clock
+            readFrameFromDisk(&(pool->frames[i])); // traz o conteudo do disco
             return &(pool->frames[i]);
         }
     }
-
-    // pool cheio usa segunda chance o clockHand roda em circulo pelos quadro se o quadro ta pinado so pula se o bit de referencia ta ligado desliga o bit e da mais uma chance sem virar vitima ainda se o bit ja ta desligado e sem pino essa vira a vitima maxVoltas eh so pra nao ficar girando pra sempre no caso raro de tudo estar pinado
-    int voltas = 0;
-    int maxVoltas = 2 * pool->activeFrameCount;
+    // sem quadro livre, pool cheio
+    // usa segunda chance o clockHand roda em circulo pelos quadro
+    // se o quadro ta pinado so pula
+    // se o bit de referencia ta ligado desliga o bit
+    // e da mais uma chance sem virar vitima ainda
+    // se o bit ja ta desligado e sem pino essa vira a vitima
+    // maxVoltas eh so pra nao ficar girando pra sempre no caso raro de tudo estar pinado
+    int voltas = 0; // contador de volta do hand
+    int maxVoltas = 2 * pool->activeFrameCount; // duas voltas completas pelos quadros ativos
 
     while (voltas < maxVoltas) {
         Frame *atual = &(pool->frames[pool->clockHand]);
+        // nem confiro o pincout = 1 porque nao tocamos em pag pinada
+        if (atual->pinCount == 0) { // sem user ativo
+            if (atual->referenced) { // se n esta pinado, mas foi usada recentecemnte
+                atual->referenced = 0; // apenas zera (segunda chance)
+            } else { // se o referenced ja era 0, vira vitima da troca
+                int victim = pool->clockHand; // salva o indice da vitima
+                pool->clockHand = (pool->clockHand + 1) % pool->activeFrameCount; // avança
 
-        if (atual->pinCount == 0) {
-            if (atual->referenced) {
-                atual->referenced = 0;
-            } else {
-                int victim = pool->clockHand;
-                pool->clockHand = (pool->clockHand + 1) % pool->activeFrameCount;
-
-                if (pool->frames[victim].dirty) {
-                    writeFrameToDisk(&(pool->frames[victim]));
+                if (pool->frames[victim].dirty) { // antes de descartar, verifica se esta suja
+                    writeFrameToDisk(&(pool->frames[victim])); // se sim, grava em disco a alteracao
                 }
-
+                // reaproveita o quadro para a nova pag
                 pool->frames[victim].blockId = blockId;
                 pool->frames[victim].tableId = tableId;
                 pool->frames[victim].dirty = 0;
@@ -153,59 +162,63 @@ Frame *pinPage(unsigned int blockId, int tableId) {
             }
         }
 
-        pool->clockHand = (pool->clockHand + 1) % pool->activeFrameCount;
-        voltas++;
+        pool->clockHand = (pool->clockHand + 1) % pool->activeFrameCount; // avança o clock
+        voltas++; // incrementa o contador de voltas do ponteiro do clock
     }
-
+    // todos os quadro ativos estavam pinados nas duas voltas do clock
     printf("ERROR: buffer pool cheio, todas as paginas estao em uso.\n");
     return NULL;
 }
-
+// devolve a pagina/despina a pag
 void unpinPage(Frame *frame) {
     if (frame == NULL) return;
-    if (frame->pinCount > 0) frame->pinCount--;
+    if (frame->pinCount > 0) frame->pinCount--; // descrementa e despina
 }
-
+// grava tudo q esta sujo/alterado na pool no disco
+// chamada em parser.c ao final de cada comando
 void flushBufferPool() {
     BufferPool *pool = manager.pool;
-    for (int i = 0; i < pool->activeFrameCount; i++) {
-        if (pool->frames[i].dirty) {
-            writeFrameToDisk(&(pool->frames[i]));
-        }
+    for (int i = 0; i < pool->activeFrameCount; i++) { // percorre todos os quadros ativos
+        if (pool->frames[i].dirty) { // para todos os alterados que destoam da versao em disco
+            writeFrameToDisk(&(pool->frames[i])); // sincroniza conteudo em disco
+        } // nao preciso zerar o dirty aqui porque ja eh feito em writeFrameToDisk
     }
 }
-
+//para decodificar a pag inteira em tuplas utilizaveis porque o diskpage.data eh um array cru de bytes
+// vai receber schema da tabela, metadados e o número da página
 PageResult *getPage(tp_table *campos, struct fs_objects objeto, int page) {
-    if (page >= PAGES || page < 0) return ERRO_PAGINA_INVALIDA;
-
+    if (page >= PAGES || page < 0) return ERRO_PAGINA_INVALIDA; // PAGES eh o max de pag por tabela
+    // pede a pag emprestada ao bm
     Frame *frame = pinPage((unsigned int) page, objeto.cod);
     if (frame == NULL) return ERRO_PAGINA_INVALIDA;
 
-    DiskPage *pagina = &(frame->page);
-
+    DiskPage *pagina = &(frame->page); // guarda um atalho pag apontando para o conteudo no frame
+    // aloca um array de struct tupla do tama do recordCount q inclui tuplas já deletadas, entao pode ficar maior q tuplas vivas
     tupla *tuplas = (tupla *) uffslloc(sizeof(tupla) * (pagina->recordCount));
     if (!tuplas) {
         unpinPage(frame);
         return ERRO_DE_ALOCACAO;
     }
-
+    // pra contar as tuplas vivas decodificadas , i eh o curso de read dentro do data
     int indiceTupla = 0, i = 0;
-    if (!pagina->usedBytes) {
+    if (!pagina->usedBytes) { // pag vazia
         unpinPage(frame);
         return NULL;
     }
-
+    // buffer temp, um byte por coluna da table
+    // 1=coluna nula 0=valor presente
+    // basicamente um mapa de nulos de cada tupla lida
     char *nullos = (char *) uffslloc(objeto.qtdCampos * sizeof(char));
 
-    while (i < pagina->usedBytes) {
-        if (isDeleted(pagina->data + i)) {
+    while (i < pagina->usedBytes) { // percorre o data byte a byte
+        if (isDeleted(pagina->data + i)) { // se deletado, pula
             i += tamTupla(campos, objeto);
             continue;
-        }
+        } // se achar tupla viva, grava a posicao (rearooveta pro delete update)
         tuplas[indiceTupla].offset = i;
         tuplas[indiceTupla].ncols = objeto.qtdCampos;
         i++;
-        memcpy(nullos, pagina->data + i, objeto.qtdCampos);
+        memcpy(nullos, pagina->data + i, objeto.qtdCampos); // copy o mapa de nulos para o buffer temp
         i += objeto.qtdCampos;
 
         tuplas[indiceTupla].column = (column *) uffslloc(sizeof(column) * objeto.qtdCampos);
@@ -262,7 +275,9 @@ void addColumn(column **colList, column *c) {
 }
 
 /*
-codigo antigo de antes do buffer manager novo mantido so comentado pra referencia historica usava a struct tp_buffer de types.h e abria fechava o arquivo a cada chamada sem cache nenhum ninguem mais chama essas funcao depois da migracao pro buffer manager novo pinPage unpinPage flushBufferPool
+codigo antigo de antes do buffer manager
+usava a struct tp_buffer de types.h e abria fechava o arquivo a cada chamada sem cache nenhum n
+ninguem mais chama essas funcao depois da migracao pro buffer manager novo pinPage unpinPage flushBufferPool
 
 int printbufferpoll(tp_buffer *buffpoll, tp_table *s, struct fs_objects objeto, int num_page){
     int aux, i, num_reg = objeto.qtdCampos;
